@@ -27,6 +27,7 @@
 import subprocess
 import time
 import sys
+import os
 
 rsyslog_daemon_name = "rsyslog"
 syslog_ng_daemon_name = "syslog-ng"
@@ -35,6 +36,7 @@ oms_agent_url = "https://raw.githubusercontent.com/Microsoft/OMS-Agent-for-Linux
 help_text = "Optional arguments for the python script are:\n\t-T: for TCP\n\t-U: for UDP which is the default value.\n\t-F: for no facility restrictions.\n\t-p: for changing default port from 25226"
 omsagent_default_incoming_port = "25226"
 daemon_default_incoming_port = "514"
+oms_agent_field_mapping_configuration = '/opt/microsoft/omsagent/plugin/filter_syslog_security.rb'
 rsyslog_daemon_forwarding_configuration_path = "/etc/rsyslog.d/security-config-omsagent.conf"
 syslog_ng_daemon_forwarding_configuration_path = "/etc/syslog-ng/conf.d/security-config-omsagent.conf"
 syslog_ng_source_content = "source s_src { udp( port(514)); tcp( port(514));};"
@@ -44,6 +46,8 @@ rsyslog_module_udp_content = "# provides UDP syslog reception\nmodule(load=\"imu
 rsyslog_module_tcp_content = "# provides TCP syslog reception\nmodule(load=\"imtcp\")\ninput(type=\"imtcp\" port=\"" + daemon_default_incoming_port + "\")\n"
 rsyslog_old_config_udp_content = "# provides UDP syslog reception\n$ModLoad imudp\n$UDPServerRun " + daemon_default_incoming_port + "\n"
 rsyslog_old_config_tcp_content = "# provides TCP syslog reception\n$ModLoad imtcp\n$InputTCPServerRun " + daemon_default_incoming_port + "\n"
+syslog_ng_documantation_path = "https://www.syslog-ng.com/technical-documents/doc/syslog-ng-open-source-edition/3.26/administration-guide/34#TOPIC-1431029"
+rsyslog_documantation_path = "https://www.rsyslog.com/doc/master/configuration/actions.html"
 oms_agent_configuration_url = "https://raw.githubusercontent.com/microsoft/OMS-Agent-for-Linux/master/installer/conf/omsagent.d/security_events.conf"
 
 
@@ -121,7 +125,12 @@ def install_omsagent(workspace_id, primary_key, oms_agent_install_url):
     :return:
     '''
     print("Installing omsagent")
-    command_tokens = ["sh", omsagent_file_name, "-w", workspace_id, "-s", primary_key, "-d", oms_agent_install_url]
+    omsagent_proxy_conf = os.getenv('https_proxy')
+    if omsagent_proxy_conf is not None:
+        print("Detected https_proxy environment variable set to " + omsagent_proxy_conf)
+        command_tokens = ["sh", omsagent_file_name, "-w", workspace_id, "-s", primary_key, "-d", oms_agent_install_url, "-p", omsagent_proxy_conf]
+    else:
+        command_tokens = ["sh", omsagent_file_name, "-w", workspace_id, "-s", primary_key, "-d", oms_agent_install_url]
     print_notice(" ".join(command_tokens))
     install_omsagent_command = subprocess.Popen(command_tokens, stdout=subprocess.PIPE)
     o, e = install_omsagent_command.communicate()
@@ -141,7 +150,8 @@ def process_check(process_name):
     '''
     p1 = subprocess.Popen(["ps", "-ef"], stdout=subprocess.PIPE)
     p2 = subprocess.Popen(["grep", "-i", process_name], stdin=p1.stdout, stdout=subprocess.PIPE)
-    o, e = p2.communicate()
+    p3 = subprocess.Popen(["grep", "-v", "grep"], stdin=p2.stdout, stdout=subprocess.PIPE)
+    o, e = p3.communicate()
     tokens = o.decode(encoding='UTF-8').split('\n')
     tokens.remove('')
     return len(tokens)
@@ -177,20 +187,29 @@ def set_omsagent_configuration(workspace_id, omsagent_incoming_port):
     :param udp:
     :return:
     '''
+    configuration_directory = "/etc/opt/microsoft/omsagent/" + workspace_id + "/conf/omsagent.d/"
     configuration_path = "/etc/opt/microsoft/omsagent/" + workspace_id + "/conf/omsagent.d/security_events.conf"
+
     print("Creating omsagent configuration to listen to syslog daemon forwarding port - " + omsagent_incoming_port)
     print("Configuration location is - " + configuration_path)
-    command_tokens = ["sudo", "wget", "-O", configuration_path, oms_agent_configuration_url]
+    mkdir_command_tokens = ["sudo", "mkdir", "-p", configuration_directory]
+    wget_command_tokens = ["sudo", "wget", "-O", configuration_path, oms_agent_configuration_url]
     print("Download configuration into the correct directory")
-    print_notice(" ".join(command_tokens))
+    print_notice(" ".join(mkdir_command_tokens))
+    print_notice(" ".join(wget_command_tokens))
     time.sleep(3)
-    set_omsagent_configuration_command = subprocess.Popen(command_tokens, stdout=subprocess.PIPE)
+    create_omsagent_configuration_directory = subprocess.Popen(mkdir_command_tokens, stdout=subprocess.PIPE)
+    set_omsagent_configuration_command = subprocess.Popen(wget_command_tokens, stdout=subprocess.PIPE)
+    o, e = create_omsagent_configuration_directory.communicate()
+    if e is not None:
+        handle_error(e, error_response_str="Error: could not create omsagent configuration directory.")
+        return False
     o, e = set_omsagent_configuration_command.communicate()
     if e is not None:
         handle_error(e, error_response_str="Error: could not download omsagent configuration.")
         return False
     print_ok("Configuration for omsagent downloaded successfully.")
-    print("Trying to changed omsagent configuration")
+    print("Trying to change omsagent configuration")
     if omsagent_incoming_port is not omsagent_default_incoming_port:
         if change_omsagent_configuration_port(omsagent_incoming_port=omsagent_incoming_port, configuration_path=configuration_path):
             print_ok("Incoming port for omsagent was changed to " + omsagent_incoming_port)
@@ -324,6 +343,25 @@ def change_omsagent_configuration_port(omsagent_incoming_port, configuration_pat
     print_ok("Omsagent incoming port was changed in configuration - " + configuration_path)
     return True
 
+def check_syslog_computer_field_mapping(workspace_id):
+    '''
+    Checking if the OMS agent maps the Computer field correctly:
+    :return: True if the mapping configuration is correct, false otherwise
+    '''
+    grep = subprocess.Popen(["grep", "-i", "'Host' => record\['host'\]",
+                             oms_agent_field_mapping_configuration], stdout=subprocess.PIPE)
+    o, e = grep.communicate()
+    if not o:
+        print_warning("Warning: Current content of the omsagent syslog filter mapping configuration doesn't map the"
+                      " Computer field from your hostname.\nTo enable the Computer field mapping, please run: \n"
+                      "\"sed -i -e \"/'Severity' => tags\[tags.size - 1\]/ a \ \\t  'Host' => record['host']\""
+                      " -e \"s/'Severity' => tags\[tags.size - 1\]/&,/\" " + oms_agent_field_mapping_configuration +
+                      " && sudo /opt/microsoft/omsagent/bin/service_control restart " + workspace_id + "\"")
+        return False
+    else:
+        print_ok("OMS Agent syslog field mapping is correct \n")
+        return True
+
 
 def restart_rsyslog():
     '''
@@ -395,7 +433,8 @@ def get_daemon_configuration_content(daemon_name, omsagent_incoming_port):
 
 def get_rsyslog_daemon_configuration_content(omsagent_incoming_port):
     '''Rsyslog accept every message containing CEF or ASA(for Cisco ASA'''
-    rsyslog_daemon_configuration_content = ":rawmsg, regex, \"CEF\"|\"ASA\" \n*.* @@127.0.0.1:"+ omsagent_incoming_port
+    rsyslog_daemon_configuration_content = "if $rawmsg contains \"CEF:\" or $rawmsg contains \"ASA-\"" \
+                                           " then @@127.0.0.1:"+ omsagent_incoming_port
     print("Rsyslog daemon configuration content:")
     content = rsyslog_daemon_configuration_content
     print_command_response(content)
@@ -418,7 +457,7 @@ def is_rsyslog():
     Returns True if the daemon is 'Rsyslog'
     '''
     # Meaning ps -ef | grep "daemon name" has returned more then the grep result
-    return process_check(rsyslog_daemon_name) > 1
+    return process_check(rsyslog_daemon_name) > 0
 
 
 def is_syslog_ng():
@@ -426,7 +465,7 @@ def is_syslog_ng():
     Returns True if the daemon is 'Syslogng'
     '''
     # Meaning ps -ef | grep "daemon name" has returned more then the grep result
-    return process_check(syslog_ng_daemon_name) > 1
+    return process_check(syslog_ng_daemon_name) > 0
 
 
 def set_syslog_ng_configuration():
@@ -463,6 +502,26 @@ def set_syslog_ng_configuration():
         append_content_to_file(line=syslog_ng_source_content, file_path=syslog_ng_conf_path)
     print_ok("Rsyslog.conf configuration was changed to fit required protocol - " + syslog_ng_conf_path)
     return True
+
+
+def print_full_disk_warning():
+    '''
+    Warn from potential full disk issues that can be caused by the daemon running on the machine.
+    The function points the user to the relevant documentation according to his daemon type.
+    '''
+    warn_message = "\nWarning: please make sure your logging daemon configuration does not store unnecessary logs. " \
+                   "This may cause a full disk on your machine, which will disrupt the function of the oms agent installed." \
+                   " For more information:"
+
+    if process_check(rsyslog_daemon_name):
+        if process_check(syslog_ng_daemon_name):
+            print_warning(warn_message + '\n' + rsyslog_documantation_path + '\n' + syslog_ng_documantation_path)
+        else:
+            print_warning(warn_message + '\n' + rsyslog_documantation_path)
+    elif process_check(syslog_ng_daemon_name):
+        print_warning(warn_message + '\n' + syslog_ng_documantation_path)
+    else:
+        print_warning("No daemon was found on the machine")
 
 
 def main():
@@ -511,6 +570,8 @@ def main():
         set_syslog_ng_configuration()
         restart_syslog_ng()
     restart_omsagent(workspace_id=workspace_id)
+    check_syslog_computer_field_mapping(workspace_id=workspace_id)
+    print_full_disk_warning()
     print_ok("Installation completed")
 
 
